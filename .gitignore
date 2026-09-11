@@ -2,7 +2,7 @@ videos/*
 wandb/*
 runs/*
 .vscode/
-trained_models/*
+trained_models/trashy_models/*
 **/__pycache__/*
 **/.ipynb_checkpoints/*
 **/.pytest_cache/*
