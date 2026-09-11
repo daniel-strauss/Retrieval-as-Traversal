@@ -1,0 +1,476 @@
+import gc
+import os
+from collections.abc import Callable
+from fractions import Fraction
+from typing import Any, Generic, SupportsFloat
+
+import av
+import gymnasium as gym
+import numpy as np
+from gymnasium import error, logger
+from gymnasium.core import ActType, ObsType, RenderFrame
+from minigrid.minigrid_env import MiniGridEnv
+from PIL import Image
+from src_new.env.agent_view_renderer import AgentViewRenderer
+from src_new.env.overlay_render import OverlayRender
+
+
+class CustomRecordVideo(
+    gym.Wrapper[ObsType, ActType, ObsType, ActType],
+    Generic[ObsType, ActType, RenderFrame],
+    gym.utils.RecordConstructorArgs,
+):
+    """
+    This is Daniels custom implementation of the RecordVideo wrapper, created by copy, pase, adapt (sorry)
+    It gives the control over when an image is captured and rendered to the user, which is necessary
+    for the renderung network state specific information.
+
+    ***Original Doc String***
+
+
+    Records videos of environment episodes using the environment's render function.
+
+    .. py:currentmodule:: gymnasium.utils.save_video
+
+    Usually, you only want to record episodes intermittently, say every hundredth episode or at every thousandth environment step.
+    To do this, you can specify ``episode_trigger`` or ``step_trigger``.
+    They should be functions returning a boolean that indicates whether a recording should be started at the
+    current episode or step, respectively.
+
+    The ``episode_trigger`` should return ``True`` on the episode when recording should start.
+    The ``step_trigger`` should return ``True`` on the n-th environment step that the recording should be started, where n sums over all previous episodes.
+    If neither :attr:`episode_trigger` nor ``step_trigger`` is passed, a default ``episode_trigger`` will be employed, i.e. :func:`capped_cubic_video_schedule`.
+    This function starts a video at every episode that is a power of 3 until 1000 and then every 1000 episodes.
+    By default, the recording will be stopped once reset is called.
+    However, you can also create recordings of fixed length (possibly spanning several episodes)
+    by passing a strictly positive value for ``video_length``.
+
+    Examples - Run the environment for 50 episodes, and save the video every 10 episodes starting from the 0th:
+        >>> import os
+        >>> import gymnasium as gym
+        >>> env = gym.make("LunarLander-v3", render_mode="rgb_array")
+        >>> trigger = lambda t: t % 10 == 0
+        >>> env = RecordVideo(env, video_folder="./save_videos1", episode_trigger=trigger, disable_logger=True)
+        >>> for i in range(50):
+        ...     termination, truncation = False, False
+        ...     _ = env.reset(seed=123)
+        ...     while not (termination or truncation):
+        ...         obs, rew, termination, truncation, info = env.step(env.action_space.sample())
+        ...
+        >>> env.close()
+        >>> len(os.listdir("./save_videos1"))
+        5
+
+    Examples - Run the environment for 5 episodes, start a recording every 200th step, making sure each video is 100 frames long:
+        >>> import os
+        >>> import gymnasium as gym
+        >>> env = gym.make("LunarLander-v3", render_mode="rgb_array")
+        >>> trigger = lambda t: t % 200 == 0
+        >>> env = RecordVideo(env, video_folder="./save_videos2", step_trigger=trigger, video_length=100, disable_logger=True)
+        >>> for i in range(5):
+        ...     termination, truncation = False, False
+        ...     _ = env.reset(seed=123)
+        ...     _ = env.action_space.seed(123)
+        ...     while not (termination or truncation):
+        ...         obs, rew, termination, truncation, info = env.step(env.action_space.sample())
+        ...
+        >>> env.close()
+        >>> len(os.listdir("./save_videos2"))
+        2
+
+    Examples - Run 3 episodes, record everything, but in chunks of 1000 frames:
+        >>> import os
+        >>> import gymnasium as gym
+        >>> env = gym.make("LunarLander-v3", render_mode="rgb_array")
+        >>> env = RecordVideo(env, video_folder="./save_videos3", video_length=1000, disable_logger=True)
+        >>> for i in range(3):
+        ...     termination, truncation = False, False
+        ...     _ = env.reset(seed=123)
+        ...     while not (termination or truncation):
+        ...         obs, rew, termination, truncation, info = env.step(env.action_space.sample())
+        ...
+        >>> env.close()
+        >>> len(os.listdir("./save_videos3"))
+        2
+
+    Change logs:
+     * v0.25.0 - Initially added to replace ``wrappers.monitoring.VideoRecorder``
+    """
+
+    def __init__(
+        self,
+        env: gym.Env[ObsType, ActType],
+        video_folder: str,
+        episode_trigger: Callable[[int], bool] | None = None,
+        num_vids_per_trigger: int = 10,  # TODO add this to debug log config
+        step_trigger: Callable[[int], bool] | None = None,
+        video_length: int = 0,
+        name_prefix: str = "rl-video",
+        fps: int | None = None,
+        disable_logger: bool = True,
+        gc_trigger: Callable[[int], bool] | None = lambda episode: True,
+    ):
+        """Wrapper records videos of rollouts.
+
+        Args:
+            env: The environment that will be wrapped
+            video_folder (str): The folder where the recordings will be stored
+            episode_trigger: Function that accepts an integer and returns ``True`` iff a recording should be started at this episode
+            num_vids_per_trigger: if episode n is triggered then episodes n, n+1, ..., n+num_vids_per_trigger-1 will be recorded
+            step_trigger: Function that accepts an integer and returns ``True`` iff a recording should be started at this step
+            video_length (int): The length of recorded episodes. If 0, entire episodes are recorded.
+                Otherwise, snippets of the specified length are captured
+            name_prefix (str): Will be prepended to the filename of the recordings
+            fps (int): The frame per second in the video. Provides a custom video fps for environment, if ``None`` then
+                the environment metadata ``render_fps`` key is used if it exists, otherwise a default value of 30 is used.
+            disable_logger (bool): Whether to disable moviepy logger or not, default it is disabled
+            gc_trigger: Function that accepts an integer and returns ``True`` iff garbage collection should be performed after this episode
+        """
+
+        if not isinstance(env.unwrapped, MiniGridEnv):
+            raise TypeError(
+                "CustomRecordVideo wrapper currently only works with environments of type MiniGridEnv"
+            )
+        self.minigrid_env = env.unwrapped
+
+        self.width = self.minigrid_env.width
+        self.height = self.minigrid_env.height
+
+        # renderers
+        self.overlay_renderer = OverlayRender(
+            tile_size=self.minigrid_env.tile_size, width=self.width, height=self.height
+        )
+        self.agent_view_renderer = AgentViewRenderer(
+            grid_w=self.width,
+            grid_h=self.height,
+            res=self.minigrid_env.tile_size,
+            max_episode_steps=env.spec.max_episode_steps or 96,
+        )
+
+        gym.utils.RecordConstructorArgs.__init__(
+            self,
+            video_folder=video_folder,
+            episode_trigger=episode_trigger,
+            step_trigger=step_trigger,
+            video_length=video_length,
+            name_prefix=name_prefix,
+            disable_logger=disable_logger,
+        )
+        gym.Wrapper.__init__(self, env)
+
+        if env.render_mode in {None, "human", "ansi"}:
+            raise ValueError(
+                f"Render mode is {env.render_mode}, which is incompatible with RecordVideo.",
+                "Initialize your environment with a render_mode that returns an image, such as rgb_array.",
+            )
+
+        if episode_trigger is None and step_trigger is None:
+            from gymnasium.utils.save_video import capped_cubic_video_schedule
+
+            episode_trigger = capped_cubic_video_schedule
+
+        self.episode_trigger = episode_trigger
+        self.num_vids_per_trigger = num_vids_per_trigger
+        self.step_trigger = step_trigger
+        self.disable_logger = disable_logger
+        self.gc_trigger = gc_trigger
+
+        self.video_folder = os.path.abspath(video_folder)
+        if os.path.isdir(self.video_folder):
+            logger.warn(
+                f"Overwriting existing videos at {self.video_folder} folder "
+                f"(try specifying a different `video_folder` for the `RecordVideo` wrapper if this is not desired)"
+            )
+        os.makedirs(self.video_folder, exist_ok=True)
+
+        if fps is None:
+            fps = self.metadata.get("render_fps", 3)
+        self.frames_per_sec: int | None = fps
+        self.name_prefix: str = name_prefix
+        self._video_name: str | None = None
+        self.video_length: int = video_length if video_length != 0 else float("inf")  # type: ignore
+        self.recording: bool = False
+        self.recorded_main_frames: list[np.ndarray] = []
+        self.recorded_agent_frames: list[np.ndarray] = []
+        self.render_history: list[RenderFrame] = []
+
+        self.step_id = -1
+        self.episode_id = -1
+
+        try:
+            import moviepy  # noqa: F401
+        except ImportError as e:
+            raise error.DependencyNotInstalled(
+                'MoviePy is not installed, run `pip install "gymnasium[other]"`'
+            ) from e
+
+    def reset(
+        self, *, seed: int | None = None, options: dict[str, Any] | None = None
+    ) -> tuple[ObsType, dict[str, Any]]:
+        """Reset the environment and eventually starts a new recording."""
+
+        if self.recording and self.video_length == float("inf"):
+            # capture last frame with no rf
+            self._capture_frame(
+                rf_bin_for_render=np.zeros((self.height, self.width), dtype=bool),
+                rf_scaled_for_render=np.zeros((self.height, self.width), dtype=float),
+                perceived_pos=None,
+                memory_retrieval_pos_for_render=None,
+            )
+            self.stop_recording()
+
+        obs, info = super().reset(seed=seed, options=options)
+        self.episode_id += 1
+
+        self.agent_view_renderer.reset()
+
+        if self.episode_trigger and any(
+            [
+                self.episode_id - i >= 0 and self.episode_trigger(self.episode_id - i)
+                for i in range(self.num_vids_per_trigger)
+            ]
+        ):
+            self.start_recording(f"{self.name_prefix}-episode-{self.episode_id}")
+            # Capture the freshly reset state so the video starts at episode start.
+            self._capture_frame(
+                rf_bin_for_render=np.zeros((self.height, self.width), dtype=bool),
+                rf_scaled_for_render=np.zeros((self.height, self.width), dtype=float),
+                perceived_pos=None,
+                memory_retrieval_pos_for_render=None,
+            )
+
+        return obs, info
+
+    def capture_frame(
+        self,
+        env_t: int,
+        rf_scaled: np.ndarray,
+        rf_binary: np.ndarray,
+        perceived_pos: tuple[int, int] | None = None,
+        memory_retrieval_pos: tuple[int, int] | None = None,
+        memory_indices_env: np.ndarray | None = None,
+        memory_masks: np.ndarray | None = None,
+    ):
+        """Capture the current (pre-step) env state with the RF overlay.
+
+        Must be called by the trainer BEFORE env.step() so that the rendered
+        frame shows the state the agent actually observed, with the RF it computed.
+
+        Args:
+            env_t: the caller's view of the current episode step (0-based).
+                   Used as a sanity check: must equal recorded_frames - 1
+                   (because reset() already captured frame 0).
+        """
+        if not self.recording:
+            return
+        # Sanity: the reset frame is frame 0, so at env_t=0 we expect 1 frame already recorded,
+        # at env_t=1 we expect 2, etc.  i.e. env_t == len(recorded_frames) - 1.
+        expected = len(self.recorded_main_frames) - 1
+        if env_t != expected:
+            raise ValueError(
+                f"capture_frame step mismatch: caller says env_t={env_t}, "
+                f"but wrapper expects {expected} (recorded_frames={len(self.recorded_main_frames)})"
+            )
+        self._capture_frame(
+            rf_bin_for_render=rf_binary,
+            rf_scaled_for_render=rf_scaled,
+            perceived_pos=perceived_pos,
+            memory_retrieval_pos_for_render=memory_retrieval_pos,
+            current_env_t=env_t,
+            memory_indices_env=memory_indices_env,
+            memory_masks=memory_masks,
+        )
+        if len(self.recorded_main_frames) > self.video_length:
+            self.stop_recording()
+
+    def step(self, action: ActType) -> tuple[ObsType, SupportsFloat, bool, bool, dict[str, Any]]:
+        """Steps the environment. Frame capture is NOT done here — the trainer
+        must call capture_frame() before step() to get correct RF-on-state alignment."""
+
+        obs, rew, terminated, truncated, info = self.env.step(action)
+        self.step_id += 1
+
+        # step_trigger: start recording at specific global steps
+        if self.step_trigger and self.step_trigger(self.step_id):
+            self.start_recording(f"{self.name_prefix}-step-{self.step_id}")
+
+        return obs, rew, terminated, truncated, info
+
+    def _capture_frame(
+        self,
+        rf_bin_for_render: np.ndarray,
+        rf_scaled_for_render: np.ndarray,
+        perceived_pos: tuple[int, int] | None = None,
+        memory_retrieval_pos_for_render: tuple[int, int] | None = None,
+        current_env_t: int | None = None,
+        memory_indices_env: np.ndarray | None = None,
+        memory_masks: np.ndarray | None = None,
+    ):
+        assert self.recording, "Cannot capture a frame, recording wasn't started."
+
+        main_frame = self.render_overlay_frame(rf_bin_for_render, rf_scaled_for_render)
+
+        self.agent_view_renderer.add_frame_info(
+            agent_pos=perceived_pos,
+            memory_retrieval_pos=memory_retrieval_pos_for_render,
+            current_env_t=current_env_t,
+            memory_indices_env=memory_indices_env,
+            memory_masks=memory_masks,
+        )
+        agent_view_frame = self.agent_view_renderer.generate_frame()
+
+        if isinstance(main_frame, list) or isinstance(agent_view_frame, list):
+            raise TypeError("Got a list of frames from render, expected a single frame. ")
+
+        if not isinstance(main_frame, np.ndarray) or not isinstance(agent_view_frame, np.ndarray):
+            raise TypeError(
+                f"Got wrong image type from render: expected np.ndarray, got"
+                f"{type(main_frame)}. Did you set rendermode to rgb_array?"
+            )
+        self.recorded_main_frames.append(main_frame)
+        self.recorded_agent_frames.append(agent_view_frame)
+
+    def render_overlay_frame(self, rf_bin: np.ndarray, rf_scaled: np.ndarray) -> np.ndarray:
+        """Compute the render frames as specified by render_mode attribute during initialization of the
+        environment. And render the overlays on top"""
+        render_out_base = super().render()
+        if not isinstance(render_out_base, np.ndarray):
+            raise TypeError(
+                f"Got wrong image type from render: expected np.ndarray, got"
+                f"{type(render_out_base)}. Did you set rendermode to rgb_array? If that type is a"
+                "list I am kind of sorry. FUCK YOU. Nah just kidding if it is a list, then "
+                "multiple frames might have been recorded, eventhough I call this function every "
+                "step and only one frame is expected. Either all frames in that list are the same"
+                "frame, or it is a list with just one frame - then just extract that frame. "
+                "If not then something weird is happening."
+            )
+
+        render_out = self.overlay_renderer.add_image_overlay(
+            base=render_out_base,
+            rf_binary=rf_bin,
+            rf_scaled=rf_scaled,
+        )
+
+        return render_out
+
+    def close(self):
+        """Closes the wrapper then the video recorder."""
+        super().close()
+        if self.recording:
+            self.stop_recording()
+
+    def start_recording(self, video_name: str):
+        """Start a new recording. If it is already recording, stops the current recording before starting the new one."""
+        if self.recording:
+            self.stop_recording()
+
+        self.recording = True
+        self._video_name = video_name
+
+    def stop_recording(self):
+        """Stop current recording and saves the video."""
+
+        assert self.recording, "stop_recording was called, but no recording was started"
+        if len(self.recorded_main_frames) == 0:
+            logger.warn("Ignored saving a video as there were zero frames to save.")
+        else:
+            if len(self.recorded_main_frames) != len(self.recorded_agent_frames):
+                raise ValueError(
+                    f"Recorded frames and agent view frames have different lengths: "
+                    f"{len(self.recorded_main_frames)} vs {len(self.recorded_agent_frames)}. "
+                    "This should never happen, please debug."
+                )
+
+            path = os.path.join(self.video_folder, f"{self._video_name}.mp4")
+            container = av.open(path, mode="w")
+            stream = container.add_stream("libx264", rate=self.frames_per_sec)
+            stream.pix_fmt = "yuv420p"
+            # Pre-compute first frame to get dimensions
+            first_combined = self._synch_frames(
+                self.recorded_main_frames[0], self.recorded_agent_frames[0]
+            )
+            h, w = first_combined.shape[:2]
+            # h264 requires even dimensions
+            stream.width = w + (w % 2)
+            stream.height = h + (h % 2)
+            stream.sample_aspect_ratio = Fraction(1, 1)
+
+            # match widths by padding the narrower frame with black
+            for main_frame, agent_view_frame in zip(
+                self.recorded_main_frames, self.recorded_agent_frames
+            ):
+                combined: np.ndarray = self._synch_frames(main_frame, agent_view_frame)
+                video_frame = av.VideoFrame.from_ndarray(combined, format="rgb24")
+                packet = stream.encode(video_frame)
+                container.mux(packet)
+
+            container.mux(stream.encode())
+            container.close()
+
+        del self.recorded_main_frames
+        del self.recorded_agent_frames
+        self.recorded_main_frames = []
+        self.recorded_agent_frames = []
+
+        self.recording = False
+        self._video_name = None
+
+        if self.gc_trigger and self.gc_trigger(self.episode_id):
+            gc.collect()
+
+    def _synch_frames(
+        self, frame_a: np.ndarray, frame_b: np.ndarray, mode="upscale", v_stack=False
+    ) -> np.ndarray:
+        """
+        Helper function to puto two frames into one. Will just stack them if they have same gluedim
+        size (for v stack gluedim is height, for h stack gluedim is width).
+        mode=upscale: Will keep the aspect ratios and scale up the smaller frame, such that
+                they gonna have the same aspect ratio.
+        mode=pad: Will keep the aspect ratios and pad the smaller frame with black
+                pixels, such that they gonna have the same aspect ratio.
+        vstack: True-> vstack images, False Hstack
+        """
+        if frame_a.shape[1] == frame_b.shape[1]:
+            if v_stack:
+                return np.vstack([frame_a, frame_b])
+            else:
+                return np.hstack([frame_a, frame_b])
+
+        stack_dim, glue_dim = (0, 1) if v_stack else (1, 0)
+
+        if mode == "upscale":
+            fs = [frame_a, frame_b]
+
+            smaller = 0 if frame_a.shape[glue_dim] < frame_b.shape[glue_dim] else 1
+
+            glued_dim_size = fs[not smaller].shape[glue_dim]
+            smaller_img = Image.fromarray(fs[smaller])
+            new_h_sm = int(
+                fs[smaller].shape[stack_dim] / fs[smaller].shape[glue_dim] * glued_dim_size
+            )
+            fs[smaller] = np.array(
+                smaller_img.resize((glued_dim_size, new_h_sm), Image.Resampling.NEAREST)
+            )
+
+            combined = np.vstack(fs) if v_stack else np.hstack(fs)
+        elif mode == "pad":
+            target_w = max(frame_a.shape[stack_dim], frame_b.shape[stack_dim])
+            frame_a = np.pad(frame_a, ((0, 0), (0, target_w - frame_a.shape[stack_dim]), (0, 0)))
+            frame_b = np.pad(
+                frame_b,
+                ((0, 0), (0, target_w - frame_b.shape[stack_dim]), (0, 0)),
+            )
+
+            combined = np.vstack([frame_a, frame_b]) if v_stack else np.hstack([frame_a, frame_b])
+        else:
+            raise ValueError(
+                f"Unknown mode {mode} for frame synchronization."
+                "Supported modes are 'upscale' and 'pad'."
+            )
+
+        return combined
+
+    def __del__(self):
+        """Warn the user in case last video wasn't saved."""
+        if len(self.recorded_main_frames) > 0:
+            logger.warn("Unable to save last video! Did you call close()?")

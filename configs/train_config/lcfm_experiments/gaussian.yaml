@@ -1,0 +1,68 @@
+# Train config for cleanrl_minigrid_example  (maps to TrainConfig)
+# Use with: python main.py --train-config configs/train_config/cleanrl_minigrid_example.yaml
+
+# Experiment identity
+exp_name: gaussian_yes_gc
+seed: 1
+torch_deterministic: true
+cuda: true # true
+
+# Environment
+env_id: MiniGrid-MemoryS17Random-v0 # MiniGrid-MemoryS9-v0
+total_timesteps: 2048000 #2048000
+
+# PPO hyperparameters
+init_lr:  2.75e-5  # 0.001 # 2.75e-4
+final_lr: 1.0e-6  #1.0e-5
+num_envs: 16
+num_rollout_steps: 256
+anneal_steps: 2048000
+gamma: 0.995
+gae_lambda: 0.95
+num_minibatches: 8
+update_epochs: 3
+norm_adv: false
+clip_coef: 0.2
+clip_vloss: true
+init_ent_coef: 0.0001
+final_ent_coef: 0.0001
+vf_coef: 0.5
+max_grad_norm: 0.25
+target_kl: null
+
+# Transformer-XL architecture
+trxl_num_layers: 2
+trxl_num_heads: 4
+trxl_dim: 256
+trxl_memory_length: 6 # 64
+trxl_positional_encoding: absolute
+reconstruction_coef: 0.0
+
+
+# new paramters
+# whether to use the old bootstrap method for value targets, which uses the value of the last state in the trajectory
+use_old_bootstrap: false # true
+#whether to apply memory masks to the memory segment before feeding it into the transformer.apply_memory_masks: 
+apply_memory_masks: false
+# whether to use uniform attention when all entries in a row of the memory segment are masked (for exploration)
+uniform_attention_on_fully_masked_rows: true
+# whether to set all memory masks to True, where the env, global step is the first env step retrieving all future memories for that step 
+hindsight_at_0: false
+
+
+# loading checkpoint
+checkpoint_path: "trained_models/cherry_models/MiniGrid-MemoryS9-v0__add_gc_prior_pe__1__04-16_16:16/checkpoints/i_80640__r_0.964/model_params"
+checkpoint_submodules: ["encoder", "transformer", "hidden_post_trxl", "actor_branches", "critic"]
+
+
+# -- Spatial memory settings (if enabled) --
+use_spatial_memory: true 
+spatial_head_type: "gaussian"
+internal_ent_coef: 0.0001 # 0.01
+retrieval_reward_coef: 0.05 # 0.0 
+internal_head_warmup_steps: 200000 # only train retrieval head for the first 100k steps 
+
+
+grid_cell_encoding: true
+grid_cell_encoding_weight: .5 # .5
+prior_pe: true 

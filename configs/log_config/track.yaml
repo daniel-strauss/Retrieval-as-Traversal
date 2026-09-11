@@ -1,0 +1,11 @@
+# Logging and tracking settings  (maps to LogConfig)
+# Override any of these by pointing --log-config at a different file.
+
+track: true 
+wandb_project_name: cleanRL
+wandb_entity: null
+capture_video: true
+num_vids_per_trigger: 50
+render_debug: false
+show_receptive_field: true
+save_model: false

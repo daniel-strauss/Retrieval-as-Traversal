@@ -1,0 +1,8 @@
+videos/*
+wandb/*
+runs/*
+.vscode/
+trained_models/*
+**/__pycache__/*
+**/.ipynb_checkpoints/*
+**/.pytest_cache/*

@@ -1,0 +1,25 @@
+# specifically this includes these experiments:
+#    -        ours: categorical, gaussian, position moving head
+#    -    baseline: with regular attention  
+# both with pretrain and without pretrain
+
+
+
+name: compare_heads
+
+# Required: path to a directory – every *.yaml / *.yml file becomes one run.
+train_config_folder: configs/train_config/lcfm_experiments
+
+# Required: shared log / W&B config for all runs.
+log_config: configs/log_config/track_and_check.yaml
+
+# Optional W&B metric to track (used by the sweep dashboard).
+metric:
+  name: episode/r_mean
+  goal: maximize
+
+# Optional: sweep parameters cross-producted with every train config.
+# Each key overrides the corresponding field in the loaded train config.
+parameters:
+  seed:
+    values: [1, 2, 3, 4, 5, 6]
