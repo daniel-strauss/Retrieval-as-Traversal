@@ -39,7 +39,7 @@ The W&B project name is configured as `cleanRL`. The W&B entity is left unset in
 After creating the sweep, the script prints the full sweep ID and the exact command needed to join it. The output should look something like this:
 
 ```text
-(clean_rl_mn) ➜  ppo_trxl python run_sweep.py create --config configs/sweeps/lcfm_experiments.yaml
+(clean_rl_mn) ➜  python run_sweep.py create --config configs/sweeps/lcfm_experiments.yaml
 Starting main.py...
 Folder sweep: 5 training config(s) found.
   configs/train_config/lcfm_experiments/as_pretrained.yaml
